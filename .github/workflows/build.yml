@@ -1,0 +1,130 @@
+name: build-rsync-macos
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'rsync version'
+        required: true
+        default: '3.5.1'
+      xxhash:
+        description: 'xxHash version'
+        required: true
+        default: '0.8.3'
+
+env:
+  V: ${{ inputs.version || '3.5.1' }}
+  XXH: ${{ inputs.xxhash || '0.8.3' }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15          # Apple Silicon
+            arch:   arm64
+            min:    '11.0'
+          - runner: macos-15-intel    # Intel x86_64
+            arch:   x86_64
+            min:    '10.13'
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCHFLAGS: -arch ${{ matrix.arch }} -mmacosx-version-min=${{ matrix.min }}
+      DEPS: ${{ github.workspace }}/deps
+    steps:
+      - name: Build static xxhash
+        run: |
+          curl -fL --retry 3 -o xxhash.tar.gz \
+            "https://github.com/Cyan4973/xxHash/archive/refs/tags/v$XXH.tar.gz"
+          tar xzf xxhash.tar.gz
+          cd "xxHash-$XXH"
+          cc -O3 $ARCHFLAGS -c xxhash.c -o xxhash.o
+          ar rcs libxxhash.a xxhash.o
+          mkdir -p "$DEPS/include" "$DEPS/lib"
+          cp xxhash.h "$DEPS/include/"
+          cp libxxhash.a "$DEPS/lib/"
+          ls -l "$DEPS/lib"
+
+      - name: Fetch rsync source
+        run: |
+          curl -fL --retry 3 -o rsync.tar.gz \
+            "https://download.samba.org/pub/rsync/src/rsync-$V.tar.gz"
+          tar xzf rsync.tar.gz
+
+      - name: Build rsync
+        run: |
+          cd "rsync-$V"
+          ./configure \
+            --enable-xxhash \
+            --disable-openssl --disable-zstd --disable-lz4 \
+            --disable-md2man \
+            CPPFLAGS="-I$DEPS/include" \
+            CFLAGS="-O2 $ARCHFLAGS" \
+            LDFLAGS="-L$DEPS/lib $ARCHFLAGS"
+          grep -i xxhash config.log | grep -i 'result\|checking' | head
+          make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Strip, sign, verify
+        run: |
+          OUT="rsync-$V-macos-${{ matrix.arch }}"
+          cp "rsync-$V/rsync" "$OUT"
+          strip -x "$OUT"
+          codesign -f -s - "$OUT"
+          file "$OUT"
+          otool -L "$OUT"
+          # 必须没有任何非系统库依赖
+          if otool -L "$OUT" | tail -n +2 | grep -v '/usr/lib/'; then
+            echo "::error::found non-system dynamic dependency"; exit 1
+          fi
+          # 必须已启用 xxhash
+          "./$OUT" --version
+          "./$OUT" --version | grep -q 'xxh128' || { echo "::error::xxhash not enabled"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsync-${{ matrix.arch }}
+          path: rsync-${{ env.V }}-macos-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rsync-*
+          path: dist
+          merge-multiple: true
+
+      - name: Make universal binary and checksums
+        run: |
+          cd dist
+          chmod +x rsync-*
+          lipo -create -output "rsync-$V-macos-universal" \
+            "rsync-$V-macos-arm64" "rsync-$V-macos-x86_64"
+          codesign -f -s - "rsync-$V-macos-universal"
+          lipo -archs "rsync-$V-macos-universal"
+          shasum -a 256 rsync-* | tee SHA256SUMS
+          ls -l
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v$V"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "rsync $V for macOS" \
+              --notes "Built from https://download.samba.org/pub/rsync/src/rsync-$V.tar.gz
+          Self-contained (depends only on /usr/lib/libSystem). xxHash $XXH statically linked; built without openssl/zstd/lz4.
+          - x86_64: Intel Mac, macOS 10.13+
+          - arm64: Apple Silicon, macOS 11+
+          - universal: both in one file"
+          fi
