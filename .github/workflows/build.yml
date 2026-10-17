@@ -94,22 +94,51 @@ jobs:
     needs: build
     runs-on: macos-15
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: rsync-*
           path: dist
           merge-multiple: true
 
-      - name: Make universal binary and checksums
+      - name: Make universal binary, stable names, checksums
         run: |
           cd dist
           chmod +x rsync-*
           lipo -create -output "rsync-$V-macos-universal" \
             "rsync-$V-macos-arm64" "rsync-$V-macos-x86_64"
           codesign -f -s - "rsync-$V-macos-universal"
-          lipo -archs "rsync-$V-macos-universal"
+          for a in arm64 x86_64 universal; do cp "rsync-$V-macos-$a" "rsync-macos-$a"; done
           shasum -a 256 rsync-* | tee SHA256SUMS
-          ls -l
+
+      - name: Generate release notes
+        run: |
+          cd dist
+          {
+            echo "Built from https://download.samba.org/pub/rsync/src/rsync-$V.tar.gz"
+            echo "xxHash $XXH statically linked. Built without openssl / zstd / lz4 / idn."
+            echo
+            echo "| File | Target |"
+            echo "|---|---|"
+            echo "| rsync-$V-macos-x86_64 | Intel Mac, macOS 10.13+ |"
+            echo "| rsync-$V-macos-arm64 | Apple Silicon, macOS 11+ |"
+            echo "| rsync-$V-macos-universal | Both architectures in one file |"
+            echo
+            echo "### Dynamic dependencies (all macOS system libraries)"
+            echo '```'
+            otool -L "rsync-$V-macos-universal"
+            echo '```'
+            echo "### rsync --version (arm64)"
+            echo '```'
+            "./rsync-$V-macos-arm64" --version
+            echo '```'
+            echo "### SHA256"
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } > ../NOTES.md
+          cat ../NOTES.md
 
       - name: Publish to GitHub Release
         env:
@@ -118,13 +147,38 @@ jobs:
           TAG="v$V"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --notes-file NOTES.md --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" dist/* \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "rsync $V for macOS" \
-              --notes "Built from https://download.samba.org/pub/rsync/src/rsync-$V.tar.gz
-          Self-contained (depends only on /usr/lib/libSystem). xxHash $XXH statically linked; built without openssl/zstd/lz4.
-          - x86_64: Intel Mac, macOS 10.13+
-          - arm64: Apple Silicon, macOS 11+
-          - universal: both in one file"
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "rsync $V for macOS" --notes-file NOTES.md
           fi
+
+      - name: Update README
+        run: |
+          {
+            echo "<!-- AUTO-START -->"
+            echo "**Latest build:** rsync $V (xxHash $XXH), $(date -u +%Y-%m-%d)"
+            echo
+            echo "| Download | Target | SHA256 |"
+            echo "|---|---|---|"
+            for a in x86_64 arm64 universal; do
+              sha=$(grep " rsync-$V-macos-$a\$" dist/SHA256SUMS | cut -d' ' -f1)
+              echo "| [rsync-macos-$a](https://github.com/$GITHUB_REPOSITORY/releases/latest/download/rsync-macos-$a) | $a | \`$sha\` |"
+            done
+            echo
+            echo "Dynamic dependencies:"
+            echo '```'
+            otool -L "dist/rsync-$V-macos-universal"
+            echo '```'
+            echo "<!-- AUTO-END -->"
+          } > auto.md
+          # 用 auto.md 替换 README 中两个标记之间的内容
+          awk -v f=auto.md '
+            /<!-- AUTO-START -->/ { while ((getline l < f) > 0) print l; skip=1; next }
+            /<!-- AUTO-END -->/   { skip=0; next }
+            !skip
+          ' README.md > README.new && mv README.new README.md
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --cached --quiet || { git commit -m "README: rsync $V"; git push; }
